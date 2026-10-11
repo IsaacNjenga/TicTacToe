@@ -1,54 +1,24 @@
-# sv
+# Little Rivals
 
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
+Little Rivals is the SvelteKit frontend for an account-based, real-time Tic Tac Toe game.
 
-## Creating a project
+## Run locally
 
-If you're seeing this, you've probably already done this step. Congrats!
+1. Start the backend after configuring its environment and MongoDB connection.
+2. Set `PUBLIC_SERVER_URL` to the backend API base (for example, `http://localhost:3001/api`).
+3. Run `npm run dev` in this directory and sign in.
 
-```sh
-# create a new project
-npx sv create my-app
-```
+The frontend uses that API base for history at `/api/games/history` and connects to the same
+backend host for the authenticated WebSocket at `/ws`.
 
-To recreate this project with the same configuration:
+## Match rules
 
-```sh
-# recreate this project
-npx sv@1.1.1 create --template minimal --types ts --add prettier eslint vitest="usages:unit,component" tailwindcss="plugins:typography,forms" sveltekit-adapter="adapter:cloudflare+cfTarget:workers" --install npm TicTacToe
-```
+- A match needs two different signed-in players. The host is X and moves first; the joiner is O.
+- Players take turns. Only the player whose symbol is next may place a mark, and a square can be used once.
+- A match ends when a player makes a three-in-a-row or when all nine squares are occupied.
+- An account can have only one unfinished match. A host may cancel a waiting match.
+- Disconnecting does not forfeit a match: reconnecting restores the saved board and turn.
+- Moves and completed results are stored by the backend. Only completed matches count in history.
 
-## Adding features
-
-Add features to your project with `sv add`:
-
-```sh
-npx sv add
-```
-
-For example, to add Tailwind CSS:
-
-```sh
-npx sv add tailwindcss
-```
-
-## Developing
-
-Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
-
-```sh
-npm run dev
-
-# or start the server and open the app in a new browser tab
-npm run dev -- --open
-```
-
-## Building
-
-To create a production version of your app:
-
-```sh
-npm run build
-```
-
-You can preview the production build with `npm run preview`.
+Game IDs contain 12 random URL-safe characters. These rules are enforced by the backend, not just
+by the disabled states in the interface.

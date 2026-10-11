@@ -3,10 +3,6 @@
 	import { mode, toggleMode } from 'mode-watcher';
 
 	let darkMode = $derived(mode.current === 'dark');
-
-	function clearScores() {
-		document.cookie = 'tttg-scores=; max-age=0; path=/; samesite=lax';
-	}
 </script>
 
 <svelte:head>
@@ -43,16 +39,17 @@
 		<div class="settings-section score-setting">
 			<div class="settings-icon"><Trophy size={20} /></div>
 			<div class="settings-description">
-				<h2>Your scoreboard</h2>
-				<p>Your match scores live in a cookie on this device.</p>
+				<h2>Your match history</h2>
+				<p>Completed online matches and player comparisons are saved to your account.</p>
 			</div>
-			<button class="settings-clear" type="button" onclick={clearScores}>Clear scores</button>
+			<a class="settings-clear" href="/history">View history</a>
 		</div>
 	</div>
 
 	<div class="settings-tip">
 		<p>
-			Your scoreboard is saved on this device. Clear your scores whenever you want a fresh start.
+			Match results are recorded by the server after a game ends. Waiting and cancelled games do not
+			affect your record.
 		</p>
 	</div>
 

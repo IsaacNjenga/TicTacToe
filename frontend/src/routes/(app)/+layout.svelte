@@ -6,7 +6,13 @@
 
 	let { children } = $props();
 	let darkMode = $derived(mode.current === 'dark');
-	let currentPage = $derived(page.url.pathname === '/settings' ? 'SETTINGS' : 'HOME');
+	let currentPage = $derived(
+		page.url.pathname === '/settings'
+			? 'SETTINGS'
+			: page.url.pathname === '/history'
+				? 'HISTORY'
+				: 'HOME'
+	);
 </script>
 
 <div class="app-shell">
