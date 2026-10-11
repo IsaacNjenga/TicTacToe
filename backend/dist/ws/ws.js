@@ -1,192 +1,435 @@
 "use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.attachGameWebSocket = attachGameWebSocket;
+const node_crypto_1 = require("node:crypto");
+const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
+const mongoose_1 = require("mongoose");
 const ws_1 = require("ws");
-const node_crypto_1 = require("node:crypto"); //generates a unique ID for each new game.
+const env_1 = require("../config/env");
+const user_model_1 = require("../modules/Users/user.model");
+const game_model_1 = require("../modules/Games/game.model");
+const winningLines = [
+    [0, 1, 2],
+    [3, 4, 5],
+    [6, 7, 8],
+    [0, 3, 6],
+    [1, 4, 7],
+    [2, 5, 8],
+    [0, 4, 8],
+    [2, 4, 6],
+];
+const webSocketServer = new ws_1.WebSocketServer({
+    noServer: true,
+    maxPayload: 4096,
+    perMessageDeflate: false,
+});
+const socketsByUser = new Map();
+const normalizedOrigin = (origin) => origin.trim().replace(/\/+$/, "");
+const allowedOrigins = [
+    "http://localhost:5173",
+    ...env_1.env.FRONTEND_URL.split(","),
+    ...env_1.env.WEBSITE_URL.split(","),
+]
+    .map(normalizedOrigin)
+    .filter(Boolean);
 function sendJson(socket, data) {
     if (socket.readyState === ws_1.WebSocket.OPEN) {
         socket.send(JSON.stringify(data));
     }
 }
-// Instead of independently sending a status to each player, create one representation of the game
-// state and sends it to every player in the session.
-// Both clients receive the same game ID and status.
-function sendGameState(game) {
-    const state = {
+function sendError(socket, message) {
+    sendJson(socket, { type: "game:error", message });
+}
+function isDuplicateKeyError(error) {
+    return (typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        error.code === 11000);
+}
+async function reservePlayer(userId, gameId) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+            await game_model_1.PlayerGameLockModel.create({ _id: userId, gameId });
+            return true;
+        }
+        catch (error) {
+            if (!isDuplicateKeyError(error)) {
+                throw error;
+            }
+            const existingLock = await game_model_1.PlayerGameLockModel.findById(userId).lean();
+            if (!existingLock) {
+                continue;
+            }
+            const existingGame = await game_model_1.GameModel.findById(existingLock.gameId)
+                .select("status")
+                .lean();
+            if (!existingGame || existingGame.status === "finished" || existingGame.status === "cancelled") {
+                await game_model_1.PlayerGameLockModel.deleteOne({
+                    _id: userId,
+                    gameId: existingLock.gameId,
+                });
+                continue;
+            }
+            return false;
+        }
+    }
+    return false;
+}
+async function releaseGameLocks(gameId) {
+    await game_model_1.PlayerGameLockModel.deleteMany({ gameId });
+}
+function serializeGame(game) {
+    return {
         type: "game:state",
-        gameId: game.id,
+        gameId: game.code,
         status: game.status,
         players: game.players.map((player) => ({
+            userId: player.userId.toString(),
+            username: player.username,
             symbol: player.symbol,
         })),
+        board: game.board,
+        turn: game.turn,
+        winnerId: game.winnerId?.toString() ?? null,
+        isDraw: game.isDraw,
+        moves: game.moves.map((move) => ({
+            userId: move.playerId.toString(),
+            symbol: move.symbol,
+            index: move.index,
+            playedAt: move.playedAt,
+        })),
+        createdAt: game.createdAt,
+        updatedAt: game.updatedAt,
     };
+}
+function sendGameState(game) {
+    const message = serializeGame(game);
     for (const player of game.players) {
-        sendJson(player.socket, state);
+        const socket = socketsByUser.get(player.userId.toString());
+        if (socket) {
+            sendJson(socket, message);
+        }
     }
 }
-//handles a disconnection.
-// If one player leaves, the remaining player is notified and the game returns to WAITING.
-function removePlayer(socket) {
-    const gameId = socketGames.get(socket);
-    if (!gameId)
-        return;
-    const game = games.get(gameId);
-    socketGames.delete(socket);
-    if (!game)
-        return;
-    game.players = game.players.filter((player) => player.socket !== socket);
-    if (game.players.length === 0) {
-        games.delete(gameId);
+async function getPlayerGame(userId) {
+    const lock = await game_model_1.PlayerGameLockModel.findById(userId).lean();
+    if (!lock) {
+        return null;
+    }
+    const game = await game_model_1.GameModel.findById(lock.gameId);
+    if (!game || game.status === "finished" || game.status === "cancelled") {
+        await game_model_1.PlayerGameLockModel.deleteOne({ _id: userId, gameId: lock.gameId });
+        return null;
+    }
+    if (!game.players.some((player) => player.userId.equals(userId))) {
+        await game_model_1.PlayerGameLockModel.deleteOne({ _id: userId, gameId: lock.gameId });
+        return null;
+    }
+    return game;
+}
+async function authenticateSocket(socket, token) {
+    if (typeof token !== "string" || token.length === 0) {
+        sendJson(socket, {
+            type: "auth:error",
+            message: "Sign in is required to play.",
+        });
+        socket.close(4401, "Authentication required");
         return;
     }
-    // The remaining player can wait for a replacement.
-    game.status = "WAITING";
-    sendJson(game.players[0].socket, {
-        type: "game:opponent_left",
-        message: "Your opponent disconnected. Waiting for another player.",
+    let payload;
+    try {
+        const decoded = jsonwebtoken_1.default.verify(token, env_1.env.JWT_SECRET);
+        if (typeof decoded === "string" ||
+            typeof decoded.userId !== "string" ||
+            !mongoose_1.Types.ObjectId.isValid(decoded.userId)) {
+            throw new Error("Invalid token payload");
+        }
+        payload = decoded;
+    }
+    catch {
+        sendJson(socket, {
+            type: "auth:error",
+            message: "Your sign-in has expired. Please sign in again.",
+        });
+        socket.close(4401, "Invalid authentication");
+        return;
+    }
+    const user = await user_model_1.UserModel.findById(payload.userId).select("_id username isActivated");
+    if (!user || !user.isActivated) {
+        sendJson(socket, {
+            type: "auth:error",
+            message: "Your account is not available for play.",
+        });
+        socket.close(4401, "Account unavailable");
+        return;
+    }
+    if (socket.readyState !== ws_1.WebSocket.OPEN) {
+        return;
+    }
+    const userId = user._id.toString();
+    const previousSocket = socketsByUser.get(userId);
+    if (previousSocket && previousSocket !== socket) {
+        previousSocket.userId = undefined;
+        previousSocket.close(4001, "A newer connection replaced this one");
+    }
+    socket.userId = userId;
+    socketsByUser.set(userId, socket);
+    if (socket.authenticationTimer) {
+        clearTimeout(socket.authenticationTimer);
+        socket.authenticationTimer = undefined;
+    }
+    sendJson(socket, {
+        type: "auth:ok",
+        userId,
+        username: user.username || "Player",
     });
+    const game = await getPlayerGame(user._id);
+    if (game) {
+        sendJson(socket, serializeGame(game));
+    }
+}
+async function createGame(socket, userId, username) {
+    const game = new game_model_1.GameModel({
+        code: (0, node_crypto_1.randomBytes)(6).toString("hex").toUpperCase(),
+        status: "waiting",
+        players: [{ userId, username, symbol: "X" }],
+    });
+    await game.save();
+    if (!(await reservePlayer(userId, game._id))) {
+        await game_model_1.GameModel.deleteOne({ _id: game._id });
+        sendError(socket, "Finish or cancel your current game before creating another.");
+        return;
+    }
     sendGameState(game);
 }
-const wss = new ws_1.WebSocketServer({ port: 8080 });
-console.log("WebSocket server starting on port 8080");
-const clients = new Set();
-const rooms = new Map();
-const clientRooms = new Map();
-const games = new Map(); // look up a session using its ID.
-const socketGames = new Map(); // Find the game a connected socket belongs to.
-function broadcastPresence() {
-    const message = {
-        type: "presence:update",
-        onlineCount: clients.size,
-    };
-    for (const client of clients) {
-        sendJson(client, message);
-    }
-}
-function broadcastToRoom(roomId, data) {
-    const members = rooms.get(roomId);
-    if (!members)
+async function joinGame(socket, userId, username, suppliedCode) {
+    if (typeof suppliedCode !== "string" ||
+        !/^[a-f\d]{12}$/i.test(suppliedCode.trim())) {
+        sendError(socket, "Enter a valid 12-character game ID.");
         return;
-    for (const client of members) {
-        sendJson(client, data);
     }
-}
-function leaveRoom(socket) {
-    const roomId = clientRooms.get(socket);
-    if (!roomId)
+    const code = suppliedCode.trim().toUpperCase();
+    const waitingGame = await game_model_1.GameModel.findOne({ code, status: "waiting" });
+    if (!waitingGame ||
+        waitingGame.players.length !== 1 ||
+        waitingGame.players[0].userId.equals(userId)) {
+        sendError(socket, "That game is unavailable or you cannot join your own game.");
         return;
-    const members = rooms.get(roomId);
-    members?.delete(socket);
-    clientRooms.delete(socket);
-    if (members?.size === 0) {
-        rooms.delete(roomId);
     }
-    else {
-        broadcastToRoom(roomId, {
-            type: "room:leave",
-            message: "A user has left the room.",
-        });
+    if (!(await reservePlayer(userId, waitingGame._id))) {
+        sendError(socket, "Finish or cancel your current game before joining another.");
+        return;
+    }
+    const joinedGame = await game_model_1.GameModel.findOneAndUpdate({
+        _id: waitingGame._id,
+        status: "waiting",
+        players: { $size: 1 },
+        "players.userId": { $ne: userId },
+    }, {
+        $push: { players: { userId, username, symbol: "O" } },
+        $set: { status: "active" },
+    }, { new: true, runValidators: true });
+    if (!joinedGame) {
+        await game_model_1.PlayerGameLockModel.deleteOne({ _id: userId, gameId: waitingGame._id });
+        sendError(socket, "That game was just joined or is no longer available.");
+        return;
+    }
+    sendGameState(joinedGame);
+}
+async function playMove(socket, userId, index) {
+    if (typeof index !== "number" ||
+        !Number.isInteger(index) ||
+        index < 0 ||
+        index > 8) {
+        sendError(socket, "Choose a square on the board.");
+        return;
+    }
+    const game = await getPlayerGame(userId);
+    if (!game) {
+        sendError(socket, "You are not currently in a game.");
+        return;
+    }
+    const player = game.players.find((candidate) => candidate.userId.equals(userId));
+    if (!player || game.status !== "active") {
+        sendError(socket, "The game is not ready for a move.");
+        return;
+    }
+    if (player.symbol !== game.turn) {
+        sendError(socket, "It is your opponent's turn.");
+        return;
+    }
+    if (game.board[index] !== null) {
+        sendError(socket, "That square is already taken.");
+        return;
+    }
+    const board = [...game.board];
+    board[index] = player.symbol;
+    const hasWon = winningLines.some((line) => line.every((square) => board[square] === player.symbol));
+    const isDraw = !hasWon && board.every((square) => square !== null);
+    const nextStatus = hasWon || isDraw ? "finished" : "active";
+    const nextTurn = player.symbol === "X" ? "O" : "X";
+    const updatedGame = await game_model_1.GameModel.findOneAndUpdate({
+        _id: game._id,
+        status: "active",
+        turn: game.turn,
+        board: game.board,
+    }, {
+        $set: {
+            board,
+            status: nextStatus,
+            turn: nextTurn,
+            winnerId: hasWon ? userId : null,
+            isDraw,
+        },
+        $push: {
+            moves: {
+                playerId: userId,
+                symbol: player.symbol,
+                index,
+                playedAt: new Date(),
+            },
+        },
+    }, { new: true, runValidators: true });
+    if (!updatedGame) {
+        const currentGame = await game_model_1.GameModel.findById(game._id);
+        if (currentGame) {
+            sendGameState(currentGame);
+        }
+        sendError(socket, "The board changed before your move was saved. Please try again.");
+        return;
+    }
+    sendGameState(updatedGame);
+    if (updatedGame.status === "finished") {
+        await releaseGameLocks(updatedGame._id);
     }
 }
-wss.on("connection", (socket) => {
-    console.log("A client connected");
-    clients.add(socket);
-    broadcastPresence();
-    socket.on("message", (rawData) => {
-        let data;
-        try {
-            data = JSON.parse(rawData.toString());
-        }
-        catch {
+async function cancelGame(socket, userId) {
+    const game = await getPlayerGame(userId);
+    if (!game) {
+        sendError(socket, "You are not currently in a game.");
+        return;
+    }
+    if (game.status !== "waiting" ||
+        !game.players[0].userId.equals(userId)) {
+        sendError(socket, "Only the host can cancel a waiting game.");
+        return;
+    }
+    const cancelledGame = await game_model_1.GameModel.findOneAndUpdate({ _id: game._id, status: "waiting", "players.0.userId": userId }, { $set: { status: "cancelled" } }, { new: true });
+    if (!cancelledGame) {
+        sendError(socket, "This game is no longer waiting.");
+        return;
+    }
+    sendGameState(cancelledGame);
+    await releaseGameLocks(cancelledGame._id);
+}
+function isMessage(value) {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+async function handleMessage(socket, raw) {
+    let message;
+    try {
+        message = JSON.parse(raw.toString());
+    }
+    catch {
+        sendError(socket, "Invalid message format.");
+        return;
+    }
+    if (!isMessage(message) || typeof message.type !== "string") {
+        sendError(socket, "A message type is required.");
+        return;
+    }
+    if (!socket.userId) {
+        if (message.type !== "auth:authenticate") {
             sendJson(socket, {
-                type: "error",
-                message: "Invalid JSON message.",
+                type: "auth:error",
+                message: "Authenticate before sending game commands.",
             });
+            socket.close(4401, "Authentication required");
             return;
         }
-        // A connection can participate in only one game at a time.
-        if (socketGames.has(socket)) {
-            sendJson(socket, {
-                type: "error",
-                message: "You are already in a game.",
-            });
+        await authenticateSocket(socket, message.token);
+        return;
+    }
+    if (message.type === "auth:authenticate") {
+        sendError(socket, "This connection is already authenticated.");
+        return;
+    }
+    const userId = new mongoose_1.Types.ObjectId(socket.userId);
+    const user = await user_model_1.UserModel.findById(userId).select("_id username isActivated");
+    if (!user || !user.isActivated) {
+        sendError(socket, "Your account is no longer available.");
+        socket.close(4401, "Account unavailable");
+        return;
+    }
+    switch (message.type) {
+        case "game:create":
+            await createGame(socket, userId, user.username || "Player");
             return;
-        }
-        if (data.type === "game:create") {
-            const gameId = (0, node_crypto_1.randomUUID)().slice(0, 8);
-            const game = {
-                id: gameId,
-                status: "WAITING",
-                players: [
-                    {
-                        socket,
-                        symbol: "X",
-                    },
-                ],
-            };
-            games.set(gameId, game);
-            socketGames.set(socket, gameId);
-            sendJson(socket, {
-                type: "game:created",
-                gameId,
-                symbol: "X",
-            });
-            sendGameState(game);
-            console.log(`Game created: ${gameId}`);
+        case "game:join":
+            await joinGame(socket, userId, user.username || "Player", message.gameId);
             return;
-        }
-        if (data.type === "game:join") {
-            const gameId = data.gameId?.trim();
-            if (!gameId) {
-                sendJson(socket, {
-                    type: "error",
-                    message: "A game ID is required.",
-                });
-                return;
-            }
-            const game = games.get(gameId);
-            if (!game) {
-                sendJson(socket, {
-                    type: "error",
-                    message: "Game not found.",
-                });
-                return;
-            }
-            if (game.status !== "WAITING" || game.players.length >= 2) {
-                sendJson(socket, {
-                    type: "error",
-                    message: "This game is not available to join.",
-                });
-                return;
-            }
-            // Assign whichever symbol is not already taken.
-            const symbol = game.players.some((player) => player.symbol === "X")
-                ? "O"
-                : "X";
-            game.players.push({ socket, symbol });
-            game.status = "READY";
-            socketGames.set(socket, gameId);
-            sendJson(socket, {
-                type: "game:joined",
-                gameId,
-                symbol,
-            });
-            sendGameState(game);
-            console.log(`Player joined game: ${gameId}`);
+        case "game:move":
+            await playMove(socket, userId, message.index);
             return;
-        }
+        case "game:cancel":
+            await cancelGame(socket, userId);
+            return;
+        default:
+            sendError(socket, "Unknown game command.");
+    }
+}
+function handleUpgrade(request, socket, head) {
+    const requestUrl = new URL(request.url ?? "/", "http://localhost");
+    const origin = request.headers.origin;
+    if (requestUrl.pathname !== "/ws") {
+        socket.destroy();
+        return;
+    }
+    if (origin && !allowedOrigins.includes(normalizedOrigin(origin))) {
+        socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+        socket.destroy();
+        return;
+    }
+    webSocketServer.handleUpgrade(request, socket, head, (webSocket) => {
+        webSocketServer.emit("connection", webSocket, request);
+    });
+}
+webSocketServer.on("connection", (webSocket) => {
+    const socket = webSocket;
+    socket.authenticationTimer = setTimeout(() => {
         sendJson(socket, {
-            type: "error",
-            message: "Unknown event type.",
+            type: "auth:error",
+            message: "Authentication timed out.",
+        });
+        socket.close(4401, "Authentication timeout");
+    }, 10000);
+    socket.on("message", (raw) => {
+        const payload = Buffer.isBuffer(raw)
+            ? raw
+            : Array.isArray(raw)
+                ? Buffer.concat(raw)
+                : Buffer.from(new Uint8Array(raw));
+        void handleMessage(socket, payload).catch((error) => {
+            console.error("Game WebSocket message failed:", error);
+            sendError(socket, "The server could not process that game action.");
         });
     });
     socket.on("close", () => {
-        leaveRoom(socket);
-        clients.delete(socket);
-        broadcastPresence();
-        console.log("A client disconnected");
+        if (socket.authenticationTimer) {
+            clearTimeout(socket.authenticationTimer);
+        }
+        if (socket.userId && socketsByUser.get(socket.userId) === socket) {
+            socketsByUser.delete(socket.userId);
+        }
     });
     socket.on("error", (error) => {
-        console.error("WebSocket error:", error);
+        console.error("Game WebSocket error:", error);
     });
 });
+function attachGameWebSocket(server) {
+    server.on("upgrade", handleUpgrade);
+}
 //# sourceMappingURL=ws.js.map
