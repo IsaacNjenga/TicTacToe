@@ -9,5 +9,8 @@
 		"directory": ".svelte-kit/cloudflare"
 	},
 	"workers_dev": true,
-	"preview_urls": true
+	"preview_urls": true,
+	"vars": {
+		"PUBLIC_SERVER_URL": "https://tictactoe-2uix.onrender.com/api"
+	}
 }
