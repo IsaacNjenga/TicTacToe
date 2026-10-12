@@ -4,10 +4,18 @@
 	import { ArrowRight, Circle, Copy, RotateCcw, Trophy, X } from '@lucide/svelte';
 	import { authCookies } from '$lib/config/auth';
 	import { PUBLIC_SERVER_URL } from '$app/env/public';
+	import { countryFlag } from '$lib/utils/country';
 
 	type PlayerSymbol = 'X' | 'O';
 	type GameStatus = 'waiting' | 'active' | 'finished' | 'cancelled';
 	type Player = { userId: string; username: string; symbol: PlayerSymbol };
+	type OnlinePlayer = {
+		userId: string;
+		username: string;
+		countryCode: string | null;
+		available: boolean;
+	};
+	type ChallengePlayer = Pick<OnlinePlayer, 'userId' | 'username' | 'countryCode'>;
 	type GameSnapshot = {
 		type: 'game:state';
 		gameId: string;
@@ -21,6 +29,13 @@
 	type ServerEvent =
 		| { type: 'auth:ok'; userId: string; username: string }
 		| { type: 'auth:error'; message: string }
+		| { type: 'presence:list'; players: OnlinePlayer[] }
+		| { type: 'challenge:incoming'; challengeId: string; challenger: ChallengePlayer }
+		| { type: 'challenge:sent'; challengeId: string; targetUserId: string; username: string }
+		| { type: 'challenge:declined'; challengeId: string; username?: string }
+		| { type: 'challenge:expired'; challengeId: string; message?: string }
+		| { type: 'challenge:cancelled'; challengeId: string }
+		| { type: 'challenge:accepted'; challengeId: string }
 		| GameSnapshot
 		| { type: 'game:error'; message: string };
 	type Connection = 'connecting' | 'connected' | 'disconnected' | 'error';
@@ -29,6 +44,15 @@
 	let authenticated = $state(false);
 	let playerId = $state('');
 	let game = $state<GameSnapshot | null>(null);
+	let onlinePlayers = $state<OnlinePlayer[]>([]);
+	let incomingChallenge = $state<{ challengeId: string; challenger: ChallengePlayer } | null>(null);
+	let outgoingChallenge = $state<{
+		challengeId: string;
+		targetUserId: string;
+		username: string;
+	} | null>(null);
+	let pendingChallengeTarget = $state('');
+	let respondingToChallenge = $state(false);
 	let joinId = $state('');
 	let notice = $state('');
 	let pending = $state<'create' | 'join' | null>(null);
@@ -97,17 +121,55 @@
 					authenticated = true;
 					playerId = data.userId;
 					retryCount = 0;
-					notice = 'Connected. Create a game or join with a friend’s ID.';
+					notice = 'Connected. Challenge an online player or use a game ID.';
 				} else if (data.type === 'auth:error') {
 					authenticated = false;
 					connection = 'error';
 					notice = data.message;
+				} else if (data.type === 'presence:list') {
+					onlinePlayers = data.players;
+				} else if (data.type === 'challenge:incoming') {
+					incomingChallenge = data;
+					respondingToChallenge = false;
+					notice = `${data.challenger.username} challenged you to a match.`;
+				} else if (data.type === 'challenge:sent') {
+					outgoingChallenge = data;
+					pendingChallengeTarget = '';
+					notice = `Challenge sent to ${data.username}. Waiting for a response.`;
+				} else if (data.type === 'challenge:declined') {
+					if (outgoingChallenge?.challengeId === data.challengeId) {
+						outgoingChallenge = null;
+						notice = `${data.username ?? 'The player'} declined your challenge.`;
+					}
+					if (incomingChallenge?.challengeId === data.challengeId) incomingChallenge = null;
+					respondingToChallenge = false;
+				} else if (data.type === 'challenge:expired') {
+					if (outgoingChallenge?.challengeId === data.challengeId) outgoingChallenge = null;
+					if (incomingChallenge?.challengeId === data.challengeId) incomingChallenge = null;
+					respondingToChallenge = false;
+					notice = data.message ?? 'The challenge expired.';
+				} else if (data.type === 'challenge:cancelled') {
+					if (outgoingChallenge?.challengeId === data.challengeId) outgoingChallenge = null;
+					if (incomingChallenge?.challengeId === data.challengeId) incomingChallenge = null;
+					respondingToChallenge = false;
+				} else if (data.type === 'challenge:accepted') {
+					outgoingChallenge = null;
+					pendingChallengeTarget = '';
+					notice = 'Challenge accepted. Your match is starting.';
 				} else if (data.type === 'game:error') {
 					pending = null;
+					pendingChallengeTarget = '';
+					respondingToChallenge = false;
 					notice = data.message;
 				} else if (data.type === 'game:state') {
 					game = data;
 					pending = null;
+					if (data.status === 'active') {
+						incomingChallenge = null;
+						outgoingChallenge = null;
+						pendingChallengeTarget = '';
+						respondingToChallenge = false;
+					}
 					if (data.status === 'waiting') {
 						notice = 'Share the game ID and wait for your opponent to join.';
 					} else if (data.status === 'active') {
@@ -133,6 +195,8 @@
 			socket = null;
 			authenticated = false;
 			pending = null;
+			pendingChallengeTarget = '';
+			respondingToChallenge = false;
 			if (disposed) return;
 			if (event.code === 4401) {
 				connection = 'error';
@@ -177,6 +241,29 @@
 
 	function cancelGame() {
 		send({ type: 'game:cancel' });
+	}
+
+	function challengePlayer(player: OnlinePlayer) {
+		if (!player.available || !canStartGame || outgoingChallenge || pendingChallengeTarget) return;
+		pendingChallengeTarget = player.userId;
+		if (!send({ type: 'challenge:send', targetUserId: player.userId })) pendingChallengeTarget = '';
+	}
+
+	function respondToChallenge(accepted: boolean) {
+		if (!incomingChallenge || respondingToChallenge) return;
+		respondingToChallenge = true;
+		const sent = send({
+			type: accepted ? 'challenge:accept' : 'challenge:decline',
+			challengeId: incomingChallenge.challengeId
+		});
+		if (sent && !accepted) incomingChallenge = null;
+		if (!sent) respondingToChallenge = false;
+	}
+
+	function cancelOutgoingChallenge() {
+		if (!outgoingChallenge) return;
+		send({ type: 'challenge:cancel', challengeId: outgoingChallenge.challengeId });
+		outgoingChallenge = null;
 	}
 
 	async function copyGameId() {
@@ -394,6 +481,82 @@
 			</div>
 		</aside>
 	</div>
+
+	<section class="online-panel" aria-labelledby="online-players-heading">
+		<div class="online-panel-heading">
+			<div>
+				<span class="mini-eyebrow">LIVE LOBBY</span>
+				<h2 id="online-players-heading">Players online</h2>
+			</div>
+			<span class="online-count"
+				><span class:live-dot={connectionIsLive}></span>{onlinePlayers.length} online</span
+			>
+		</div>
+
+		{#if incomingChallenge}
+			<div class="challenge-incoming" role="status">
+				<div class="challenge-player-flag" aria-hidden="true">
+					{countryFlag(incomingChallenge.challenger.countryCode) || '✦'}
+				</div>
+				<div class="challenge-copy">
+					<strong>{incomingChallenge.challenger.username} wants to play</strong>
+					<span>Accept to start a match right away.</span>
+				</div>
+				<div class="challenge-actions">
+					<button
+						type="button"
+						class="challenge-accept"
+						onclick={() => respondToChallenge(true)}
+						disabled={respondingToChallenge}>Accept</button
+					>
+					<button
+						type="button"
+						class="challenge-decline"
+						onclick={() => respondToChallenge(false)}
+						disabled={respondingToChallenge}>Decline</button
+					>
+				</div>
+			</div>
+		{/if}
+
+		{#if outgoingChallenge}
+			<div class="challenge-outgoing" role="status">
+				<span>Waiting for {outgoingChallenge.username} to respond…</span>
+				<button type="button" onclick={cancelOutgoingChallenge}>Cancel challenge</button>
+			</div>
+		{/if}
+
+		{#if onlinePlayers.length === 0}
+			<p class="online-empty">No other players are online right now.</p>
+		{:else}
+			<div class="online-player-list">
+				{#each onlinePlayers as player (player.userId)}
+					<div class="online-player-row">
+						<div class="online-avatar" aria-hidden="true">
+							{player.username.slice(0, 1).toUpperCase()}
+						</div>
+						<div class="online-player-name">
+							<strong>{countryFlag(player.countryCode)} {player.username}</strong>
+							<span>{player.available ? 'Available to play' : 'In a match'}</span>
+						</div>
+						<button
+							type="button"
+							class="challenge-button"
+							onclick={() => challengePlayer(player)}
+							disabled={!connectionIsLive ||
+								!player.available ||
+								!canStartGame ||
+								outgoingChallenge !== null ||
+								pendingChallengeTarget !== ''}
+							aria-label={`Challenge ${player.username}`}
+						>
+							Challenge
+						</button>
+					</div>
+				{/each}
+			</div>
+		{/if}
+	</section>
 
 	{#if notice}
 		<p class="game-notice" role="status">{notice}</p>

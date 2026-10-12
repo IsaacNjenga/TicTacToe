@@ -93,6 +93,13 @@ export class UserService {
     }
 
     const updateData = sanitizeUpdateData(data, requesterRole);
+    if (updateData.countryCode !== undefined) {
+      const countryCode = updateData.countryCode?.trim().toUpperCase() || null;
+      if (countryCode && !/^[A-Z]{2}$/.test(countryCode)) {
+        throw new BadRequestError("Country must be a two-letter country code");
+      }
+      updateData.countryCode = countryCode;
+    }
     const user = await UserModel.findByIdAndUpdate(userId, updateData, {
       new: true,
       runValidators: true,

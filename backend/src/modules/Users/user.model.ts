@@ -19,6 +19,14 @@ const UserSchema = new mongoose.Schema(
 
     avatar: { type: String, default: null },
 
+    countryCode: {
+      type: String,
+      trim: true,
+      uppercase: true,
+      match: /^[A-Z]{2}$/,
+      default: null,
+    },
+
     isActivated: { type: Boolean, default: false },
 
     refreshToken: {

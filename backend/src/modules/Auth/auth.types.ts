@@ -3,6 +3,7 @@ export interface SignupDTO {
   email: string;
   password: string;
   avatar?: string;
+  countryCode?: string;
 }
 
 export interface SigninDTO {

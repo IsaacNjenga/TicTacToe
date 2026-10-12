@@ -26,6 +26,10 @@ const createAccount = async (input) => {
     if (input.password.length < 8) {
         throw new BadRequestError_1.BadRequestError("Password must be at least 8 characters long");
     }
+    const countryCode = input.countryCode?.trim().toUpperCase();
+    if (countryCode && !/^[A-Z]{2}$/.test(countryCode)) {
+        throw new BadRequestError_1.BadRequestError("Country must be a two-letter country code");
+    }
     const email = input.email.toLowerCase().trim();
     const existingEmail = await user_model_1.UserModel.findOne({
         email,
@@ -39,6 +43,7 @@ const createAccount = async (input) => {
         ...input,
         username,
         email,
+        countryCode: countryCode || undefined,
         password: passwordHash,
         avatar: defaultAvatarUrl,
     };

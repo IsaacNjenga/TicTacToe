@@ -8,6 +8,7 @@ export interface SignInInput {
 
 export interface SignUpInput extends SignInInput {
 	username: string;
+	countryCode?: string;
 }
 
 export interface RequestOTPInput {

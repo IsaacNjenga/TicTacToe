@@ -12,6 +12,7 @@
 	import EyeOff from '@lucide/svelte/icons/eye-off';
 
 	let username = $state('');
+	let countryCode = $state('');
 	let email = $state('');
 	let password = $state('');
 	let confirmPassword = $state('');
@@ -31,6 +32,7 @@
 		try {
 			await authService.fetchSignUp({
 				username: username.trim(),
+				countryCode: countryCode.trim().toUpperCase(),
 				email: email.trim(),
 				password
 			});
@@ -68,6 +70,23 @@
 					bind:value={username}
 					required
 				/>
+			</div>
+
+			<div class="space-y-2">
+				<Label for="country-code">Country (optional)</Label>
+				<Input
+					id="country-code"
+					name="countryCode"
+					type="text"
+					placeholder="US"
+					maxlength={2}
+					pattern="[A-Za-z]{2}"
+					autocomplete="country"
+					bind:value={countryCode}
+				/>
+				<p class="text-xs text-muted-foreground">
+					Enter your 2-letter country code for the leaderboard flag.
+				</p>
 			</div>
 
 			<div class="space-y-2">

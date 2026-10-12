@@ -147,3 +147,61 @@ export const getGameHistory = catchAsync(
     });
   },
 );
+
+export const getLeaderboard = catchAsync(
+  async (_req: AuthenticatedRequest, res: Response) => {
+    const standings = await GameModel.aggregate([
+      { $match: { status: "finished" } },
+      { $unwind: "$players" },
+      {
+        $group: {
+          _id: "$players.userId",
+          username: { $first: "$players.username" },
+          played: { $sum: 1 },
+          wins: {
+            $sum: { $cond: [{ $eq: ["$winnerId", "$players.userId"] }, 1, 0] },
+          },
+          draws: { $sum: { $cond: ["$isDraw", 1, 0] } },
+          losses: {
+            $sum: {
+              $cond: [
+                {
+                  $and: [
+                    { $ne: ["$winnerId", null] },
+                    { $ne: ["$winnerId", "$players.userId"] },
+                  ],
+                },
+                1,
+                0,
+              ],
+            },
+          },
+        },
+      },
+      {
+        $lookup: {
+          from: "users",
+          localField: "_id",
+          foreignField: "_id",
+          as: "profile",
+        },
+      },
+      { $unwind: { path: "$profile", preserveNullAndEmptyArrays: true } },
+      {
+        $project: {
+          _id: 0,
+          userId: { $toString: "$_id" },
+          username: { $ifNull: ["$profile.username", "$username"] },
+          countryCode: { $ifNull: ["$profile.countryCode", null] },
+          played: 1,
+          wins: 1,
+          draws: 1,
+          losses: 1,
+        },
+      },
+      { $sort: { wins: -1, draws: -1, losses: 1, username: 1 } },
+    ]);
+
+    res.status(200).json({ success: true, data: standings });
+  },
+);

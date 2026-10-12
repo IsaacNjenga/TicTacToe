@@ -10,7 +10,6 @@ const normalizeOrigin = (origin: string) => origin.trim().replace(/\/$/, "");
 const allowedOrigins = [
   "http://localhost:5173",
   ...env.FRONTEND_URL.split(","),
-  ...env.WEBSITE_URL.split(","),
 ]
   .map(normalizeOrigin)
   .filter(Boolean);

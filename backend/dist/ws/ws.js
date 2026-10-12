@@ -9,6 +9,7 @@ const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
 const mongoose_1 = require("mongoose");
 const ws_1 = require("ws");
 const env_1 = require("../config/env");
+const mailer_1 = require("../utils/mailer");
 const user_model_1 = require("../modules/Users/user.model");
 const game_model_1 = require("../modules/Games/game.model");
 const winningLines = [
@@ -27,12 +28,10 @@ const webSocketServer = new ws_1.WebSocketServer({
     perMessageDeflate: false,
 });
 const socketsByUser = new Map();
+const challengesById = new Map();
+const challengeByUser = new Map();
 const normalizedOrigin = (origin) => origin.trim().replace(/\/+$/, "");
-const allowedOrigins = [
-    "http://localhost:5173",
-    ...env_1.env.FRONTEND_URL.split(","),
-    ...env_1.env.WEBSITE_URL.split(","),
-]
+const allowedOrigins = ["http://localhost:5173", ...env_1.env.FRONTEND_URL.split(",")]
     .map(normalizedOrigin)
     .filter(Boolean);
 function sendJson(socket, data) {
@@ -42,6 +41,226 @@ function sendJson(socket, data) {
 }
 function sendError(socket, message) {
     sendJson(socket, { type: "game:error", message });
+}
+async function getOnlinePlayers(excludedUserId) {
+    return Promise.all([...socketsByUser.entries()]
+        .filter(([userId]) => userId !== excludedUserId)
+        .map(async ([userId, socket]) => ({
+        userId,
+        username: socket.username || "Player",
+        countryCode: socket.countryCode ?? null,
+        available: !(await getPlayerGame(new mongoose_1.Types.ObjectId(userId))),
+    })));
+}
+async function sendPresence(socket) {
+    if (!socket.userId)
+        return;
+    sendJson(socket, {
+        type: "presence:list",
+        players: await getOnlinePlayers(socket.userId),
+    });
+}
+function broadcastPresence() {
+    for (const socket of socketsByUser.values()) {
+        void sendPresence(socket).catch((error) => {
+            console.error("Online player list failed:", error);
+        });
+    }
+}
+function clearChallenge(challenge) {
+    clearTimeout(challenge.timeout);
+    challengesById.delete(challenge.id);
+    if (challengeByUser.get(challenge.fromUserId) === challenge.id) {
+        challengeByUser.delete(challenge.fromUserId);
+    }
+    if (challengeByUser.get(challenge.toUserId) === challenge.id) {
+        challengeByUser.delete(challenge.toUserId);
+    }
+}
+function notifyChallengePeer(challenge, userId, data) {
+    const socket = socketsByUser.get(userId);
+    if (socket)
+        sendJson(socket, data);
+}
+async function sendChallenge(socket, user, targetUserId) {
+    if (typeof targetUserId !== "string" ||
+        !mongoose_1.Types.ObjectId.isValid(targetUserId)) {
+        sendError(socket, "Choose a valid online player to challenge.");
+        return;
+    }
+    const toUserId = new mongoose_1.Types.ObjectId(targetUserId).toString();
+    const fromUserId = user._id.toString();
+    const targetSocket = socketsByUser.get(toUserId);
+    if (toUserId === fromUserId || !targetSocket) {
+        sendError(socket, "That player is no longer online.");
+        return;
+    }
+    if (challengeByUser.has(fromUserId) || challengeByUser.has(toUserId)) {
+        sendError(socket, "One of you already has a pending challenge.");
+        return;
+    }
+    if (await getPlayerGame(user._id)) {
+        sendError(socket, "Finish your current game before challenging someone.");
+        return;
+    }
+    if (await getPlayerGame(new mongoose_1.Types.ObjectId(toUserId))) {
+        sendError(socket, "That player is already in a game.");
+        broadcastPresence();
+        return;
+    }
+    if (!socketsByUser.has(toUserId) ||
+        challengeByUser.has(fromUserId) ||
+        challengeByUser.has(toUserId)) {
+        sendError(socket, "That player is no longer available for a challenge.");
+        return;
+    }
+    const availableTargetSocket = socketsByUser.get(toUserId);
+    if (!availableTargetSocket) {
+        sendError(socket, "That player is no longer online.");
+        return;
+    }
+    const id = (0, node_crypto_1.randomBytes)(8).toString("hex");
+    const challenge = {
+        id,
+        fromUserId,
+        toUserId,
+        fromUsername: user.username || "Player",
+        fromCountryCode: user.countryCode ?? null,
+        timeout: setTimeout(() => {
+            clearChallenge(challenge);
+            notifyChallengePeer(challenge, fromUserId, {
+                type: "challenge:expired",
+                challengeId: id,
+                message: "Your challenge expired without a response.",
+            });
+            notifyChallengePeer(challenge, toUserId, {
+                type: "challenge:expired",
+                challengeId: id,
+                message: "The challenge expired.",
+            });
+        }, 60000),
+    };
+    challengesById.set(id, challenge);
+    challengeByUser.set(fromUserId, id);
+    challengeByUser.set(toUserId, id);
+    sendJson(socket, {
+        type: "challenge:sent",
+        challengeId: id,
+        targetUserId: toUserId,
+        username: availableTargetSocket.username || "Player",
+    });
+    sendJson(availableTargetSocket, {
+        type: "challenge:incoming",
+        challengeId: id,
+        challenger: {
+            userId: fromUserId,
+            username: challenge.fromUsername,
+            countryCode: challenge.fromCountryCode,
+        },
+    });
+    if (availableTargetSocket.email) {
+        const frontendUrl = env_1.env.FRONTEND_URL.split(",")[0]
+            .trim()
+            .replace(/\/+$/, "");
+        void mailer_1.transporter
+            .sendMail({
+            from: env_1.env.EMAIL_USER,
+            to: availableTargetSocket.email,
+            subject: `${challenge.fromUsername} challenged you on Little Rivals`,
+            text: `${challenge.fromUsername} challenged you to a Tic Tac Toe match. Sign in to respond: ${frontendUrl}/home`,
+        })
+            .catch((error) => {
+            console.error("Challenge notification email failed:", error);
+        });
+    }
+}
+async function respondToChallenge(socket, userId, challengeId, accepted) {
+    if (typeof challengeId !== "string") {
+        sendError(socket, "That challenge is no longer available.");
+        return;
+    }
+    const challenge = challengesById.get(challengeId);
+    if (!challenge || challenge.toUserId !== userId.toString()) {
+        sendError(socket, "That challenge is no longer available.");
+        return;
+    }
+    const challengerSocket = socketsByUser.get(challenge.fromUserId);
+    if (!challengerSocket) {
+        clearChallenge(challenge);
+        sendJson(socket, {
+            type: "challenge:expired",
+            challengeId,
+            message: "The challenger went offline.",
+        });
+        return;
+    }
+    if (!accepted) {
+        clearChallenge(challenge);
+        sendJson(socket, { type: "challenge:declined", challengeId });
+        sendJson(challengerSocket, {
+            type: "challenge:declined",
+            challengeId,
+            username: socket.username || "Player",
+        });
+        return;
+    }
+    if ((await getPlayerGame(new mongoose_1.Types.ObjectId(challenge.fromUserId))) ||
+        (await getPlayerGame(userId))) {
+        clearChallenge(challenge);
+        sendJson(socket, {
+            type: "challenge:expired",
+            challengeId,
+            message: "A player is already in a game.",
+        });
+        sendJson(challengerSocket, {
+            type: "challenge:expired",
+            challengeId,
+            message: "The challenge could not start because a player entered a game.",
+        });
+        broadcastPresence();
+        return;
+    }
+    const game = new game_model_1.GameModel({
+        code: (0, node_crypto_1.randomBytes)(6).toString("hex").toUpperCase(),
+        status: "active",
+        players: [
+            {
+                userId: new mongoose_1.Types.ObjectId(challenge.fromUserId),
+                username: challenge.fromUsername,
+                symbol: "X",
+            },
+            { userId, username: socket.username || "Player", symbol: "O" },
+        ],
+    });
+    await game.save();
+    const challengerReserved = await reservePlayer(new mongoose_1.Types.ObjectId(challenge.fromUserId), game._id);
+    const recipientReserved = challengerReserved && (await reservePlayer(userId, game._id));
+    if (!challengerReserved || !recipientReserved) {
+        await releaseGameLocks(game._id);
+        await game_model_1.GameModel.deleteOne({ _id: game._id });
+        clearChallenge(challenge);
+        sendError(socket, "A player entered another game before the challenge was accepted.");
+        sendError(challengerSocket, "The challenge could not start because a player entered another game.");
+        broadcastPresence();
+        return;
+    }
+    clearChallenge(challenge);
+    sendJson(challengerSocket, { type: "challenge:accepted", challengeId });
+    sendGameState(game);
+    broadcastPresence();
+}
+function cancelChallenge(socket, userId, challengeId) {
+    if (typeof challengeId !== "string")
+        return;
+    const challenge = challengesById.get(challengeId);
+    if (!challenge || challenge.fromUserId !== userId.toString())
+        return;
+    clearChallenge(challenge);
+    notifyChallengePeer(challenge, challenge.toUserId, {
+        type: "challenge:cancelled",
+        challengeId,
+    });
+    sendJson(socket, { type: "challenge:cancelled", challengeId });
 }
 function isDuplicateKeyError(error) {
     return (typeof error === "object" &&
@@ -66,7 +285,9 @@ async function reservePlayer(userId, gameId) {
             const existingGame = await game_model_1.GameModel.findById(existingLock.gameId)
                 .select("status")
                 .lean();
-            if (!existingGame || existingGame.status === "finished" || existingGame.status === "cancelled") {
+            if (!existingGame ||
+                existingGame.status === "finished" ||
+                existingGame.status === "cancelled") {
                 await game_model_1.PlayerGameLockModel.deleteOne({
                     _id: userId,
                     gameId: existingLock.gameId,
@@ -157,7 +378,7 @@ async function authenticateSocket(socket, token) {
         socket.close(4401, "Invalid authentication");
         return;
     }
-    const user = await user_model_1.UserModel.findById(payload.userId).select("_id username isActivated");
+    const user = await user_model_1.UserModel.findById(payload.userId).select("_id username countryCode email isActivated");
     if (!user || !user.isActivated) {
         sendJson(socket, {
             type: "auth:error",
@@ -176,6 +397,9 @@ async function authenticateSocket(socket, token) {
         previousSocket.close(4001, "A newer connection replaced this one");
     }
     socket.userId = userId;
+    socket.username = user.username || "Player";
+    socket.countryCode = user.countryCode ?? null;
+    socket.email = user.email ?? undefined;
     socketsByUser.set(userId, socket);
     if (socket.authenticationTimer) {
         clearTimeout(socket.authenticationTimer);
@@ -190,6 +414,7 @@ async function authenticateSocket(socket, token) {
     if (game) {
         sendJson(socket, serializeGame(game));
     }
+    broadcastPresence();
 }
 async function createGame(socket, userId, username) {
     const game = new game_model_1.GameModel({
@@ -204,6 +429,7 @@ async function createGame(socket, userId, username) {
         return;
     }
     sendGameState(game);
+    broadcastPresence();
 }
 async function joinGame(socket, userId, username, suppliedCode) {
     if (typeof suppliedCode !== "string" ||
@@ -233,11 +459,15 @@ async function joinGame(socket, userId, username, suppliedCode) {
         $set: { status: "active" },
     }, { new: true, runValidators: true });
     if (!joinedGame) {
-        await game_model_1.PlayerGameLockModel.deleteOne({ _id: userId, gameId: waitingGame._id });
+        await game_model_1.PlayerGameLockModel.deleteOne({
+            _id: userId,
+            gameId: waitingGame._id,
+        });
         sendError(socket, "That game was just joined or is no longer available.");
         return;
     }
     sendGameState(joinedGame);
+    broadcastPresence();
 }
 async function playMove(socket, userId, index) {
     if (typeof index !== "number" ||
@@ -304,6 +534,7 @@ async function playMove(socket, userId, index) {
     sendGameState(updatedGame);
     if (updatedGame.status === "finished") {
         await releaseGameLocks(updatedGame._id);
+        broadcastPresence();
     }
 }
 async function cancelGame(socket, userId) {
@@ -312,8 +543,7 @@ async function cancelGame(socket, userId) {
         sendError(socket, "You are not currently in a game.");
         return;
     }
-    if (game.status !== "waiting" ||
-        !game.players[0].userId.equals(userId)) {
+    if (game.status !== "waiting" || !game.players[0].userId.equals(userId)) {
         sendError(socket, "Only the host can cancel a waiting game.");
         return;
     }
@@ -324,6 +554,7 @@ async function cancelGame(socket, userId) {
     }
     sendGameState(cancelledGame);
     await releaseGameLocks(cancelledGame._id);
+    broadcastPresence();
 }
 function isMessage(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -358,7 +589,7 @@ async function handleMessage(socket, raw) {
         return;
     }
     const userId = new mongoose_1.Types.ObjectId(socket.userId);
-    const user = await user_model_1.UserModel.findById(userId).select("_id username isActivated");
+    const user = await user_model_1.UserModel.findById(userId).select("_id username countryCode email isActivated");
     if (!user || !user.isActivated) {
         sendError(socket, "Your account is no longer available.");
         socket.close(4401, "Account unavailable");
@@ -376,6 +607,18 @@ async function handleMessage(socket, raw) {
             return;
         case "game:cancel":
             await cancelGame(socket, userId);
+            return;
+        case "challenge:send":
+            await sendChallenge(socket, user, message.targetUserId);
+            return;
+        case "challenge:accept":
+            await respondToChallenge(socket, userId, message.challengeId, true);
+            return;
+        case "challenge:decline":
+            await respondToChallenge(socket, userId, message.challengeId, false);
+            return;
+        case "challenge:cancel":
+            cancelChallenge(socket, userId, message.challengeId);
             return;
         default:
             sendError(socket, "Unknown game command.");
@@ -422,7 +665,24 @@ webSocketServer.on("connection", (webSocket) => {
             clearTimeout(socket.authenticationTimer);
         }
         if (socket.userId && socketsByUser.get(socket.userId) === socket) {
-            socketsByUser.delete(socket.userId);
+            const userId = socket.userId;
+            socketsByUser.delete(userId);
+            const challengeId = challengeByUser.get(userId);
+            const challenge = challengeId
+                ? challengesById.get(challengeId)
+                : undefined;
+            if (challenge) {
+                clearChallenge(challenge);
+                const peerId = challenge.fromUserId === userId
+                    ? challenge.toUserId
+                    : challenge.fromUserId;
+                notifyChallengePeer(challenge, peerId, {
+                    type: "challenge:expired",
+                    challengeId,
+                    message: "The other player went offline.",
+                });
+            }
+            broadcastPresence();
         }
     });
     socket.on("error", (error) => {

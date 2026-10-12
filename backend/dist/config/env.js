@@ -16,7 +16,6 @@ const envSchema = zod_1.z.object({
     EMAIL_PASS: zod_1.z.string().min(1),
     REDIS_URL: zod_1.z.string().min(1),
     FRONTEND_URL: zod_1.z.string().min(1),
-    WEBSITE_URL: zod_1.z.string().min(1),
 });
 // This will throw an error if process.env.variable is missing
 // REDIS_HOST: z.string().min(1),

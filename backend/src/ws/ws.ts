@@ -5,6 +5,7 @@ import { Types } from "mongoose";
 import { Duplex } from "node:stream";
 import { RawData, WebSocket, WebSocketServer } from "ws";
 import { env } from "../config/env";
+import { transporter } from "../utils/mailer";
 import { UserModel } from "../modules/Users/user.model";
 import {
   GameModel,
@@ -17,6 +18,9 @@ import {
 type AuthPayload = JwtPayload & { userId?: string };
 type AuthenticatedSocket = WebSocket & {
   userId?: string;
+  username?: string;
+  countryCode?: string | null;
+  email?: string;
   authenticationTimer?: NodeJS.Timeout;
 };
 type Message = {
@@ -24,6 +28,17 @@ type Message = {
   token?: unknown;
   gameId?: unknown;
   index?: unknown;
+  targetUserId?: unknown;
+  challengeId?: unknown;
+};
+
+type PendingChallenge = {
+  id: string;
+  fromUserId: string;
+  toUserId: string;
+  fromUsername: string;
+  fromCountryCode: string | null;
+  timeout: NodeJS.Timeout;
 };
 
 const winningLines = [
@@ -43,12 +58,10 @@ const webSocketServer = new WebSocketServer({
   perMessageDeflate: false,
 });
 const socketsByUser = new Map<string, AuthenticatedSocket>();
+const challengesById = new Map<string, PendingChallenge>();
+const challengeByUser = new Map<string, string>();
 const normalizedOrigin = (origin: string) => origin.trim().replace(/\/+$/, "");
-const allowedOrigins = [
-  "http://localhost:5173",
-  ...env.FRONTEND_URL.split(","),
-  ...env.WEBSITE_URL.split(","),
-]
+const allowedOrigins = ["http://localhost:5173", ...env.FRONTEND_URL.split(",")]
   .map(normalizedOrigin)
   .filter(Boolean);
 
@@ -60,6 +73,275 @@ function sendJson(socket: WebSocket, data: object) {
 
 function sendError(socket: WebSocket, message: string) {
   sendJson(socket, { type: "game:error", message });
+}
+
+async function getOnlinePlayers(excludedUserId?: string) {
+  return Promise.all(
+    [...socketsByUser.entries()]
+      .filter(([userId]) => userId !== excludedUserId)
+      .map(async ([userId, socket]) => ({
+        userId,
+        username: socket.username || "Player",
+        countryCode: socket.countryCode ?? null,
+        available: !(await getPlayerGame(new Types.ObjectId(userId))),
+      })),
+  );
+}
+
+async function sendPresence(socket: AuthenticatedSocket) {
+  if (!socket.userId) return;
+  sendJson(socket, {
+    type: "presence:list",
+    players: await getOnlinePlayers(socket.userId),
+  });
+}
+
+function broadcastPresence() {
+  for (const socket of socketsByUser.values()) {
+    void sendPresence(socket).catch((error: unknown) => {
+      console.error("Online player list failed:", error);
+    });
+  }
+}
+
+function clearChallenge(challenge: PendingChallenge) {
+  clearTimeout(challenge.timeout);
+  challengesById.delete(challenge.id);
+  if (challengeByUser.get(challenge.fromUserId) === challenge.id) {
+    challengeByUser.delete(challenge.fromUserId);
+  }
+  if (challengeByUser.get(challenge.toUserId) === challenge.id) {
+    challengeByUser.delete(challenge.toUserId);
+  }
+}
+
+function notifyChallengePeer(
+  challenge: PendingChallenge,
+  userId: string,
+  data: object,
+) {
+  const socket = socketsByUser.get(userId);
+  if (socket) sendJson(socket, data);
+}
+
+async function sendChallenge(
+  socket: AuthenticatedSocket,
+  user: {
+    _id: Types.ObjectId;
+    username: string;
+    countryCode?: string | null;
+    email?: string | null;
+  },
+  targetUserId: unknown,
+) {
+  if (
+    typeof targetUserId !== "string" ||
+    !Types.ObjectId.isValid(targetUserId)
+  ) {
+    sendError(socket, "Choose a valid online player to challenge.");
+    return;
+  }
+  const toUserId = new Types.ObjectId(targetUserId).toString();
+  const fromUserId = user._id.toString();
+  const targetSocket = socketsByUser.get(toUserId);
+  if (toUserId === fromUserId || !targetSocket) {
+    sendError(socket, "That player is no longer online.");
+    return;
+  }
+  if (challengeByUser.has(fromUserId) || challengeByUser.has(toUserId)) {
+    sendError(socket, "One of you already has a pending challenge.");
+    return;
+  }
+  if (await getPlayerGame(user._id)) {
+    sendError(socket, "Finish your current game before challenging someone.");
+    return;
+  }
+  if (await getPlayerGame(new Types.ObjectId(toUserId))) {
+    sendError(socket, "That player is already in a game.");
+    broadcastPresence();
+    return;
+  }
+  if (
+    !socketsByUser.has(toUserId) ||
+    challengeByUser.has(fromUserId) ||
+    challengeByUser.has(toUserId)
+  ) {
+    sendError(socket, "That player is no longer available for a challenge.");
+    return;
+  }
+  const availableTargetSocket = socketsByUser.get(toUserId);
+  if (!availableTargetSocket) {
+    sendError(socket, "That player is no longer online.");
+    return;
+  }
+
+  const id = randomBytes(8).toString("hex");
+  const challenge: PendingChallenge = {
+    id,
+    fromUserId,
+    toUserId,
+    fromUsername: user.username || "Player",
+    fromCountryCode: user.countryCode ?? null,
+    timeout: setTimeout(() => {
+      clearChallenge(challenge);
+      notifyChallengePeer(challenge, fromUserId, {
+        type: "challenge:expired",
+        challengeId: id,
+        message: "Your challenge expired without a response.",
+      });
+      notifyChallengePeer(challenge, toUserId, {
+        type: "challenge:expired",
+        challengeId: id,
+        message: "The challenge expired.",
+      });
+    }, 60_000),
+  };
+  challengesById.set(id, challenge);
+  challengeByUser.set(fromUserId, id);
+  challengeByUser.set(toUserId, id);
+  sendJson(socket, {
+    type: "challenge:sent",
+    challengeId: id,
+    targetUserId: toUserId,
+    username: availableTargetSocket.username || "Player",
+  });
+  sendJson(availableTargetSocket, {
+    type: "challenge:incoming",
+    challengeId: id,
+    challenger: {
+      userId: fromUserId,
+      username: challenge.fromUsername,
+      countryCode: challenge.fromCountryCode,
+    },
+  });
+
+  if (availableTargetSocket.email) {
+    const frontendUrl = env.FRONTEND_URL.split(",")[0]
+      .trim()
+      .replace(/\/+$/, "");
+    void transporter
+      .sendMail({
+        from: env.EMAIL_USER,
+        to: availableTargetSocket.email,
+        subject: `${challenge.fromUsername} challenged you on Little Rivals`,
+        text: `${challenge.fromUsername} challenged you to a Tic Tac Toe match. Sign in to respond: ${frontendUrl}/home`,
+      })
+      .catch((error: unknown) => {
+        console.error("Challenge notification email failed:", error);
+      });
+  }
+}
+
+async function respondToChallenge(
+  socket: AuthenticatedSocket,
+  userId: Types.ObjectId,
+  challengeId: unknown,
+  accepted: boolean,
+) {
+  if (typeof challengeId !== "string") {
+    sendError(socket, "That challenge is no longer available.");
+    return;
+  }
+  const challenge = challengesById.get(challengeId);
+  if (!challenge || challenge.toUserId !== userId.toString()) {
+    sendError(socket, "That challenge is no longer available.");
+    return;
+  }
+  const challengerSocket = socketsByUser.get(challenge.fromUserId);
+  if (!challengerSocket) {
+    clearChallenge(challenge);
+    sendJson(socket, {
+      type: "challenge:expired",
+      challengeId,
+      message: "The challenger went offline.",
+    });
+    return;
+  }
+  if (!accepted) {
+    clearChallenge(challenge);
+    sendJson(socket, { type: "challenge:declined", challengeId });
+    sendJson(challengerSocket, {
+      type: "challenge:declined",
+      challengeId,
+      username: socket.username || "Player",
+    });
+    return;
+  }
+
+  if (
+    (await getPlayerGame(new Types.ObjectId(challenge.fromUserId))) ||
+    (await getPlayerGame(userId))
+  ) {
+    clearChallenge(challenge);
+    sendJson(socket, {
+      type: "challenge:expired",
+      challengeId,
+      message: "A player is already in a game.",
+    });
+    sendJson(challengerSocket, {
+      type: "challenge:expired",
+      challengeId,
+      message: "The challenge could not start because a player entered a game.",
+    });
+    broadcastPresence();
+    return;
+  }
+
+  const game = new GameModel({
+    code: randomBytes(6).toString("hex").toUpperCase(),
+    status: "active",
+    players: [
+      {
+        userId: new Types.ObjectId(challenge.fromUserId),
+        username: challenge.fromUsername,
+        symbol: "X",
+      },
+      { userId, username: socket.username || "Player", symbol: "O" },
+    ],
+  });
+  await game.save();
+  const challengerReserved = await reservePlayer(
+    new Types.ObjectId(challenge.fromUserId),
+    game._id,
+  );
+  const recipientReserved =
+    challengerReserved && (await reservePlayer(userId, game._id));
+  if (!challengerReserved || !recipientReserved) {
+    await releaseGameLocks(game._id);
+    await GameModel.deleteOne({ _id: game._id });
+    clearChallenge(challenge);
+    sendError(
+      socket,
+      "A player entered another game before the challenge was accepted.",
+    );
+    sendError(
+      challengerSocket,
+      "The challenge could not start because a player entered another game.",
+    );
+    broadcastPresence();
+    return;
+  }
+
+  clearChallenge(challenge);
+  sendJson(challengerSocket, { type: "challenge:accepted", challengeId });
+  sendGameState(game);
+  broadcastPresence();
+}
+
+function cancelChallenge(
+  socket: AuthenticatedSocket,
+  userId: Types.ObjectId,
+  challengeId: unknown,
+) {
+  if (typeof challengeId !== "string") return;
+  const challenge = challengesById.get(challengeId);
+  if (!challenge || challenge.fromUserId !== userId.toString()) return;
+  clearChallenge(challenge);
+  notifyChallengePeer(challenge, challenge.toUserId, {
+    type: "challenge:cancelled",
+    challengeId,
+  });
+  sendJson(socket, { type: "challenge:cancelled", challengeId });
 }
 
 function isDuplicateKeyError(error: unknown): boolean {
@@ -92,7 +374,11 @@ async function reservePlayer(
       const existingGame = await GameModel.findById(existingLock.gameId)
         .select("status")
         .lean();
-      if (!existingGame || existingGame.status === "finished" || existingGame.status === "cancelled") {
+      if (
+        !existingGame ||
+        existingGame.status === "finished" ||
+        existingGame.status === "cancelled"
+      ) {
         await PlayerGameLockModel.deleteOne({
           _id: userId,
           gameId: existingLock.gameId,
@@ -196,7 +482,9 @@ async function authenticateSocket(socket: AuthenticatedSocket, token: unknown) {
     return;
   }
 
-  const user = await UserModel.findById(payload.userId).select("_id username isActivated");
+  const user = await UserModel.findById(payload.userId).select(
+    "_id username countryCode email isActivated",
+  );
   if (!user || !user.isActivated) {
     sendJson(socket, {
       type: "auth:error",
@@ -217,6 +505,9 @@ async function authenticateSocket(socket: AuthenticatedSocket, token: unknown) {
   }
 
   socket.userId = userId;
+  socket.username = user.username || "Player";
+  socket.countryCode = user.countryCode ?? null;
+  socket.email = user.email ?? undefined;
   socketsByUser.set(userId, socket);
   if (socket.authenticationTimer) {
     clearTimeout(socket.authenticationTimer);
@@ -233,9 +524,14 @@ async function authenticateSocket(socket: AuthenticatedSocket, token: unknown) {
   if (game) {
     sendJson(socket, serializeGame(game));
   }
+  broadcastPresence();
 }
 
-async function createGame(socket: AuthenticatedSocket, userId: Types.ObjectId, username: string) {
+async function createGame(
+  socket: AuthenticatedSocket,
+  userId: Types.ObjectId,
+  username: string,
+) {
   const game = new GameModel({
     code: randomBytes(6).toString("hex").toUpperCase(),
     status: "waiting",
@@ -245,11 +541,15 @@ async function createGame(socket: AuthenticatedSocket, userId: Types.ObjectId, u
   await game.save();
   if (!(await reservePlayer(userId, game._id))) {
     await GameModel.deleteOne({ _id: game._id });
-    sendError(socket, "Finish or cancel your current game before creating another.");
+    sendError(
+      socket,
+      "Finish or cancel your current game before creating another.",
+    );
     return;
   }
 
   sendGameState(game);
+  broadcastPresence();
 }
 
 async function joinGame(
@@ -273,12 +573,18 @@ async function joinGame(
     waitingGame.players.length !== 1 ||
     waitingGame.players[0].userId.equals(userId)
   ) {
-    sendError(socket, "That game is unavailable or you cannot join your own game.");
+    sendError(
+      socket,
+      "That game is unavailable or you cannot join your own game.",
+    );
     return;
   }
 
   if (!(await reservePlayer(userId, waitingGame._id))) {
-    sendError(socket, "Finish or cancel your current game before joining another.");
+    sendError(
+      socket,
+      "Finish or cancel your current game before joining another.",
+    );
     return;
   }
 
@@ -297,15 +603,23 @@ async function joinGame(
   );
 
   if (!joinedGame) {
-    await PlayerGameLockModel.deleteOne({ _id: userId, gameId: waitingGame._id });
+    await PlayerGameLockModel.deleteOne({
+      _id: userId,
+      gameId: waitingGame._id,
+    });
     sendError(socket, "That game was just joined or is no longer available.");
     return;
   }
 
   sendGameState(joinedGame);
+  broadcastPresence();
 }
 
-async function playMove(socket: AuthenticatedSocket, userId: Types.ObjectId, index: unknown) {
+async function playMove(
+  socket: AuthenticatedSocket,
+  userId: Types.ObjectId,
+  index: unknown,
+) {
   if (
     typeof index !== "number" ||
     !Number.isInteger(index) ||
@@ -322,7 +636,9 @@ async function playMove(socket: AuthenticatedSocket, userId: Types.ObjectId, ind
     return;
   }
 
-  const player = game.players.find((candidate) => candidate.userId.equals(userId));
+  const player = game.players.find((candidate) =>
+    candidate.userId.equals(userId),
+  );
   if (!player || game.status !== "active") {
     sendError(socket, "The game is not ready for a move.");
     return;
@@ -377,13 +693,17 @@ async function playMove(socket: AuthenticatedSocket, userId: Types.ObjectId, ind
     if (currentGame) {
       sendGameState(currentGame);
     }
-    sendError(socket, "The board changed before your move was saved. Please try again.");
+    sendError(
+      socket,
+      "The board changed before your move was saved. Please try again.",
+    );
     return;
   }
 
   sendGameState(updatedGame);
   if (updatedGame.status === "finished") {
     await releaseGameLocks(updatedGame._id);
+    broadcastPresence();
   }
 }
 
@@ -394,10 +714,7 @@ async function cancelGame(socket: AuthenticatedSocket, userId: Types.ObjectId) {
     return;
   }
 
-  if (
-    game.status !== "waiting" ||
-    !game.players[0].userId.equals(userId)
-  ) {
+  if (game.status !== "waiting" || !game.players[0].userId.equals(userId)) {
     sendError(socket, "Only the host can cancel a waiting game.");
     return;
   }
@@ -414,6 +731,7 @@ async function cancelGame(socket: AuthenticatedSocket, userId: Types.ObjectId) {
 
   sendGameState(cancelledGame);
   await releaseGameLocks(cancelledGame._id);
+  broadcastPresence();
 }
 
 function isMessage(value: unknown): value is Message {
@@ -453,7 +771,9 @@ async function handleMessage(socket: AuthenticatedSocket, raw: Buffer) {
   }
 
   const userId = new Types.ObjectId(socket.userId);
-  const user = await UserModel.findById(userId).select("_id username isActivated");
+  const user = await UserModel.findById(userId).select(
+    "_id username countryCode email isActivated",
+  );
   if (!user || !user.isActivated) {
     sendError(socket, "Your account is no longer available.");
     socket.close(4401, "Account unavailable");
@@ -472,6 +792,18 @@ async function handleMessage(socket: AuthenticatedSocket, raw: Buffer) {
       return;
     case "game:cancel":
       await cancelGame(socket, userId);
+      return;
+    case "challenge:send":
+      await sendChallenge(socket, user, message.targetUserId);
+      return;
+    case "challenge:accept":
+      await respondToChallenge(socket, userId, message.challengeId, true);
+      return;
+    case "challenge:decline":
+      await respondToChallenge(socket, userId, message.challengeId, false);
+      return;
+    case "challenge:cancel":
+      cancelChallenge(socket, userId, message.challengeId);
       return;
     default:
       sendError(socket, "Unknown game command.");
@@ -524,7 +856,25 @@ webSocketServer.on("connection", (webSocket) => {
       clearTimeout(socket.authenticationTimer);
     }
     if (socket.userId && socketsByUser.get(socket.userId) === socket) {
-      socketsByUser.delete(socket.userId);
+      const userId = socket.userId;
+      socketsByUser.delete(userId);
+      const challengeId = challengeByUser.get(userId);
+      const challenge = challengeId
+        ? challengesById.get(challengeId)
+        : undefined;
+      if (challenge) {
+        clearChallenge(challenge);
+        const peerId =
+          challenge.fromUserId === userId
+            ? challenge.toUserId
+            : challenge.fromUserId;
+        notifyChallengePeer(challenge, peerId, {
+          type: "challenge:expired",
+          challengeId,
+          message: "The other player went offline.",
+        });
+      }
+      broadcastPresence();
     }
   });
 

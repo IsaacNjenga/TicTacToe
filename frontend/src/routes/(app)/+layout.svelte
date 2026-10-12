@@ -4,6 +4,7 @@
 	// import { mode, toggleMode } from 'mode-watcher';
 	import AppSidebar from '../../lib/layout/AppSidebar.svelte';
 	import { SidebarProvider } from '../../lib/components/ui/sidebar';
+	import { SidebarTrigger } from '$lib/components/ui/sidebar';
 
 	let { children } = $props();
 	// let darkMode = $derived(mode.current === 'dark');
@@ -19,7 +20,10 @@
 <div class="app-shell">
 	<SidebarProvider>
 		<AppSidebar />
-
+		<header class="mobile-sidebar-bar md:hidden">
+			<SidebarTrigger aria-label="Open navigation menu" />
+			<span>little<span class="mobile-brand-accent">rivals</span></span>
+		</header>
 		{@render children()}
 	</SidebarProvider>
 </div>
