@@ -80,6 +80,7 @@ exports.activateAccountController = (0, catchAsync_1.catchAsync)(async (req, res
 });
 exports.changePasswordController = (0, catchAsync_1.catchAsync)(async (req, res) => {
     await (0, auth_service_1.changePassword)(req.body);
+    console.log(req.body.email);
     const targetUser = await user_model_1.UserModel.findOne({ email: req.body.email });
     if (targetUser) {
         await (0, logs_service_1.createLog)({
@@ -99,6 +100,7 @@ exports.changePasswordController = (0, catchAsync_1.catchAsync)(async (req, res)
 });
 exports.requestPasswordResetOtpController = (0, catchAsync_1.catchAsync)(async (req, res) => {
     await (0, auth_service_1.requestPasswordResetOtp)(req.body);
+    // console.log(req.body.email);
     const targetUser = await user_model_1.UserModel.findOne({ email: req.body.email });
     if (targetUser) {
         await (0, logs_service_1.createLog)({

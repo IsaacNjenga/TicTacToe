@@ -89,6 +89,7 @@ const changePassword = async (input) => {
         throw new BadRequestError_1.BadRequestError("Email is required");
     }
     const email = input.email;
+    // console.log(email)
     const user = await user_model_1.UserModel.findOne({ email }).select("+password");
     if (!user) {
         throw new BadRequestError_1.BadRequestError("User not found");
@@ -115,7 +116,8 @@ const requestPasswordResetOtp = async (input) => {
         throw new BadRequestError_1.BadRequestError("Email is required");
     }
     const email = input.email.toLowerCase().trim();
-    const user = await user_model_1.UserModel.findOne({ email: input.email });
+    // console.log(email);
+    const user = await user_model_1.UserModel.findOne({ email });
     if (!user) {
         throw new BadRequestError_1.BadRequestError("User not found");
     }
@@ -158,18 +160,19 @@ const resetPassword = async (input) => {
     if (!input.email) {
         throw new BadRequestError_1.BadRequestError("Email is required");
     }
-    const isOTPVerified = await otp_model_1.OtpModel.findOne({ email: input.email });
-    if (!isOTPVerified) {
-        throw new BadRequestError_1.BadRequestError("Invalid or expired OTP");
+    const email = input.email.toLowerCase().trim();
+    const verifiedOtp = await otp_model_1.OtpModel.findOne({ email, verified: true });
+    if (!verifiedOtp) {
+        throw new BadRequestError_1.BadRequestError("OTP must be verified before resetting password");
     }
-    const user = await user_model_1.UserModel.findOne({ email: input.email });
+    const user = await user_model_1.UserModel.findOne({ email });
     if (!user) {
         throw new BadRequestError_1.BadRequestError("User not found");
     }
     const newPasswordHash = await bcryptjs_1.default.hash(input.newPassword, 10);
     user.password = newPasswordHash;
     await user.save();
-    await otp_model_1.OtpModel.deleteOne({ email: input.email });
+    await otp_model_1.OtpModel.deleteOne({ email });
     return true;
 };
 exports.resetPassword = resetPassword;

@@ -1,8 +1,8 @@
 <script lang="ts">
-	import { navigating } from '$app/state';
+	import { navigating } from '$app/stores';
 </script>
 
-{#if navigating !== null}
+{#if navigating != null}
 	<div
 		class="fixed top-0 right-0 left-0 z-100 h-0.5 w-full overflow-hidden bg-primary/10 backdrop-blur-xs"
 	>

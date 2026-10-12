@@ -107,7 +107,7 @@ export const activateAccountController = catchAsync(
 export const changePasswordController = catchAsync(
   async (req: Request, res: Response) => {
     await changePassword(req.body);
-
+    console.log(req.body.email);
     const targetUser = await UserModel.findOne({ email: req.body.email });
     if (targetUser) {
       await createLog({
@@ -131,7 +131,7 @@ export const changePasswordController = catchAsync(
 export const requestPasswordResetOtpController = catchAsync(
   async (req: Request, res: Response) => {
     await requestPasswordResetOtp(req.body);
-
+    // console.log(req.body.email);
     const targetUser = await UserModel.findOne({ email: req.body.email });
     if (targetUser) {
       await createLog({

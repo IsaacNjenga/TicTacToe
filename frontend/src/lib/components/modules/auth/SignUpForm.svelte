@@ -8,12 +8,15 @@
 	import { Input } from '$lib/components/ui/input';
 	import { Label } from '$lib/components/ui/label';
 	import { authService } from '$lib/services/auth/auth.service';
+	import Eye from '@lucide/svelte/icons/eye';
+	import EyeOff from '@lucide/svelte/icons/eye-off';
 
 	let username = $state('');
 	let email = $state('');
 	let password = $state('');
 	let confirmPassword = $state('');
 	let isLoading = $state(false);
+	let showPassword = $state(false);
 
 	async function handleSubmission(event: SubmitEvent) {
 		event.preventDefault();
@@ -82,30 +85,56 @@
 
 			<div class="space-y-2">
 				<Label for="password">Password</Label>
-				<Input
-					id="password"
-					name="password"
-					type="password"
-					placeholder="At least 8 characters"
-					autocomplete="new-password"
-					minlength={8}
-					bind:value={password}
-					required
-				/>
+				<div class="relative">
+					<Input
+						id="password"
+						name="password"
+						type={showPassword ? 'text' : 'password'}
+						placeholder="At least 8 characters"
+						autocomplete="new-password"
+						minlength={8}
+						bind:value={password}
+						required
+					/><button
+						type="button"
+						class="absolute top-1/2 right-3 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+						aria-label={showPassword ? 'Hide password' : 'Show password'}
+						onclick={() => (showPassword = !showPassword)}
+					>
+						{#if showPassword}
+							<EyeOff class="size-4" />
+						{:else}
+							<Eye class="size-4" />
+						{/if}
+					</button>
+				</div>
 			</div>
 
 			<div class="space-y-2">
 				<Label for="confirm-password">Confirm password</Label>
-				<Input
-					id="confirm-password"
-					name="confirm-password"
-					type="password"
-					placeholder="Enter your password again"
-					autocomplete="new-password"
-					minlength={8}
-					bind:value={confirmPassword}
-					required
-				/>
+				<div class="relative">
+					<Input
+						id="confirm-password"
+						name="confirm-password"
+						type={showPassword ? 'text' : 'password'}
+						placeholder="Enter your password again"
+						autocomplete="new-password"
+						minlength={8}
+						bind:value={confirmPassword}
+						required
+					/><button
+						type="button"
+						class="absolute top-1/2 right-3 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+						aria-label={showPassword ? 'Hide password' : 'Show password'}
+						onclick={() => (showPassword = !showPassword)}
+					>
+						{#if showPassword}
+							<EyeOff class="size-4" />
+						{:else}
+							<Eye class="size-4" />
+						{/if}
+					</button>
+				</div>
 			</div>
 
 			<Button type="submit" class="w-full" disabled={isLoading}>

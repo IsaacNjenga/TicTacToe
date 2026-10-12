@@ -115,6 +115,7 @@ export const changePassword = async (
   }
 
   const email = input.email;
+  // console.log(email)
   const user = await UserModel.findOne({ email }).select("+password");
   if (!user) {
     throw new BadRequestError("User not found");
@@ -154,7 +155,8 @@ export const requestPasswordResetOtp = async (
   }
 
   const email = input.email.toLowerCase().trim();
-  const user = await UserModel.findOne({ email: input.email });
+  // console.log(email);
+  const user = await UserModel.findOne({ email });
   if (!user) {
     throw new BadRequestError("User not found");
   }
@@ -211,12 +213,13 @@ export const resetPassword = async (
     throw new BadRequestError("Email is required");
   }
 
-  const isOTPVerified = await OtpModel.findOne({ email: input.email });
-  if (!isOTPVerified) {
-    throw new BadRequestError("Invalid or expired OTP");
+  const email = input.email.toLowerCase().trim();
+  const verifiedOtp = await OtpModel.findOne({ email, verified: true });
+  if (!verifiedOtp) {
+    throw new BadRequestError("OTP must be verified before resetting password");
   }
 
-  const user = await UserModel.findOne({ email: input.email });
+  const user = await UserModel.findOne({ email });
   if (!user) {
     throw new BadRequestError("User not found");
   }
@@ -225,7 +228,7 @@ export const resetPassword = async (
   user.password = newPasswordHash;
   await user.save();
 
-  await OtpModel.deleteOne({ email: input.email });
+  await OtpModel.deleteOne({ email });
 
   return true;
 };

@@ -962,9 +962,9 @@
 
 .page-footer {
 	display: flex;
-	justify-content: space-between;
+	justify-content: center;
 	gap: 12px;
-	margin-top: auto;
+	margin: auto;
 	padding-top: 23px;
 	color: var(--muted);
 	font-size: 8px;
